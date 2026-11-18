@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>XR Experiment Lab</title>
+  <meta name="description" content="WebXR physics sandbox with spatial experiment comparison: record runs, overlay paths, replay and scrub.">
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./src/style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./lib/three/three.module.js",
+        "three/addons/": "./lib/three/addons/",
+        "cannon-es": "./lib/cannon-es/cannon-es.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="viewport" aria-label="3D experiment view"></div>
+
+  <!-- Everything inside #ui-root is also shown over the camera view in phone AR (WebXR DOM overlay). -->
+  <div id="ui-root">
+    <button id="panel-toggle" type="button" aria-expanded="true" aria-controls="panel">Hide panel</button>
+    <aside id="panel" aria-label="Experiment controls"></aside>
+    <div id="xr-buttons"></div>
+    <div id="toast" role="status" aria-live="polite"></div>
+  </div>
+
+  <noscript>This app needs JavaScript and a WebGL-capable browser.</noscript>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
