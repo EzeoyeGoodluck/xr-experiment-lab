@@ -1,13 +1,14 @@
 {
   "name": "xr-experiment-lab",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "WebXR physics sandbox with spatial experiment comparison (record, overlay, replay and scrub runs).",
   "scripts": {
     "start": "python3 -m http.server 8000",
     "test": "node --import ./tests/setup.mjs --test tests/*.test.js",
-    "test:browser": "node tests/browser-smoke.mjs"
+    "test:browser": "node tests/browser-smoke.mjs",
+    "test:vr": "node tests/vr-e2e.mjs"
   },
   "license": "MIT"
 }

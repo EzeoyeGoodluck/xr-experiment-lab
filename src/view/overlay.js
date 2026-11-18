@@ -1,9 +1,14 @@
 // Spatial comparison: draws the recorded paths of Run A and Run B in the same
-// scene, with time ticks, translucent "ghost" objects you can scrub through
-// time, wireframes of each run's fixed setup, and a link showing the gap.
+// scene, with time ticks, impact markers, translucent "ghost" objects (and
+// ghost springs/hinges) you can scrub through time, velocity/force arrows on
+// the ghosts, wireframes of each run's fixed setup, and a link showing the gap.
 import * as THREE from 'three';
 import { buildMesh, applyPose, disposeObject } from './objectViews.js';
+import { createConstraintVisual } from './constraintViews.js';
+import { ArrowSet } from './arrows.js';
 import { samplePose, STRIDE } from '../core/recorder.js';
+import { velocityAt, contactForceAt, impacts, springEnds, poseInRun } from '../core/derived.js';
+import { isConstraint, isObject, toWorld } from '../core/defs.js';
 
 export const RUN_COLORS = { A: 0x3b82f6, B: 0xf97316 };
 export const RUN_CSS = { A: '#3b82f6', B: '#f97316' };
@@ -17,7 +22,7 @@ export class ComparisonOverlay {
     parent.add(this.group);
     this.runs = { A: null, B: null };
     this.parts = { A: null, B: null };
-    this.options = { paths: true, ghosts: true, setups: true };
+    this.options = { paths: true, ghosts: true, setups: true, arrows: false, impacts: true };
     this.time = 0;
 
     const linkGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
@@ -25,6 +30,7 @@ export class ComparisonOverlay {
     this.link.visible = false;
     this.link.frustumCulled = false;
     this.group.add(this.link);
+    this.arrows = new ArrowSet(this.group);
   }
 
   setRuns(slots) {
@@ -44,7 +50,9 @@ export class ComparisonOverlay {
     const root = new THREE.Group();
     root.name = `run-${slot}`;
     const paths = new THREE.Group();
+    const marks = new THREE.Group();
     const ghosts = new Map();
+    const ghostLinks = [];
     const setups = new THREE.Group();
     const defsById = new Map(run.setup.map((d) => [d.id, d]));
 
@@ -70,8 +78,8 @@ export class ComparisonOverlay {
         tube.raycast = () => {};
         paths.add(tube);
 
-        // Equal-time ticks: spacing shows speed at a glance.
-        const tickCount = Math.floor((run.duration) / TICK_SECONDS) + 1;
+        // Equal-time ticks: spacing shows speed at a glance (every 4th tick is brighter = 1 s).
+        const tickCount = Math.floor(run.duration / TICK_SECONDS) + 1;
         const ticks = new THREE.InstancedMesh(new THREE.SphereGeometry(0.011, 10, 6),
           new THREE.MeshBasicMaterial({ color: 0xffffff }), tickCount);
         const m = new THREE.Matrix4();
@@ -83,6 +91,18 @@ export class ComparisonOverlay {
         }
         ticks.raycast = () => {};
         paths.add(ticks);
+
+        // Impact markers: flat rings where the object hit something.
+        for (const hit of impacts(track.samples, run.dt)) {
+          const ring = new THREE.Mesh(new THREE.TorusGeometry(Math.min(0.05, 0.015 + hit.dv * 0.01), 0.004, 6, 24),
+            new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, depthTest: false }));
+          ring.position.fromArray(hit.p);
+          ring.rotation.x = Math.PI / 2;
+          ring.renderOrder = 5;
+          ring.userData.impact = hit;
+          ring.raycast = () => {};
+          marks.add(ring);
+        }
       }
 
       const ghost = buildMesh(def, { ghost: { color, opacity: 0.5 } });
@@ -90,30 +110,40 @@ export class ComparisonOverlay {
       root.add(ghost);
     }
 
+    // Ghost springs and hinges follow the ghost objects.
+    for (const def of run.setup.filter(isConstraint)) {
+      const v = createConstraintVisual(def, { ghost: { color, opacity: 0.75 } });
+      root.add(v.root);
+      ghostLinks.push({ def, ...v });
+    }
+
     // Wireframes of the fixed parts of this run's setup (e.g. the ramp at its angle in this run).
     for (const def of run.setup) {
-      if (run.tracks[def.id]) continue;
+      if (!isObject(def) || run.tracks[def.id]) continue;
       const wire = buildMesh(def, { ghost: { color, opacity: 0.55, wireframe: def.kind !== 'target' } });
       applyPose(wire, def.position, def.quaternion);
       setups.add(wire);
     }
 
-    root.add(paths, setups);
+    root.add(paths, marks, setups);
     this.group.add(root);
-    return { root, paths, ghosts, setups, primaryId: run.metrics?.primaryId ?? null };
+    return { root, paths, marks, ghosts, ghostLinks, setups, primaryId: run.metrics?.primaryId ?? null };
   }
 
   setOptions(opts) {
     Object.assign(this.options, opts);
     this.applyOptions();
+    this.setTime(this.time);
   }
 
   applyOptions() {
     for (const part of Object.values(this.parts)) {
       if (!part) continue;
       part.paths.visible = this.options.paths;
+      part.marks.visible = this.options.impacts;
       part.setups.visible = this.options.setups;
       for (const g of part.ghosts.values()) g.visible = this.options.ghosts;
+      for (const l of part.ghostLinks) l.root.visible = this.options.ghosts;
     }
     this.updateLink();
   }
@@ -124,16 +154,43 @@ export class ComparisonOverlay {
 
   setTime(t) {
     this.time = Math.max(0, Math.min(t, this.duration()));
+    const arrows = [];
     for (const slot of ['A', 'B']) {
       const part = this.parts[slot];
       const run = this.runs[slot];
       if (!part) continue;
       for (const [id, ghost] of part.ghosts) {
-        const pose = samplePose(run.tracks[id].samples, run.dt, this.time);
-        if (pose) applyPose(ghost, pose.p, pose.q);
+        const track = run.tracks[id];
+        const pose = samplePose(track.samples, run.dt, this.time);
+        if (!pose) continue;
+        applyPose(ghost, pose.p, pose.q);
+        if (this.options.arrows && this.options.ghosts) {
+          const def = run.setup.find((d) => d.id === id);
+          arrows.push({
+            id: `${slot}:${id}`, origin: pose.p,
+            velocity: velocityAt(track.samples, run.dt, this.time),
+            force: contactForceAt(track.samples, run.dt, this.time, def?.mass ?? 1),
+          });
+        }
+      }
+      const poseOf = (id) => poseInRun(run, id, this.time);
+      for (const l of part.ghostLinks) {
+        if (l.def.kind === 'spring') {
+          const ends = springEnds(run, l.def, this.time, poseOf);
+          if (ends) l.update(ends[0], ends[1]);
+        } else {
+          const pa = poseOf(l.def.a);
+          if (pa) l.update(toWorld(pa, l.def.pivotA));
+        }
       }
     }
+    this.arrows.set(arrows);
     this.updateLink();
+    // Highlight impacts that have already happened by this time.
+    for (const part of Object.values(this.parts)) {
+      if (!part) continue;
+      for (const ring of part.marks.children) ring.material.opacity = ring.userData.impact.t <= this.time + 1e-6 ? 0.95 : 0.3;
+    }
   }
 
   /** White line between the primary object in A and B at the current time. */

@@ -1,6 +1,6 @@
 // Describes what changed between two experiment setups, so a comparison is
 // tied to the design change that caused it. Pure JS.
-import { quatAngleDeg } from './defs.js';
+import { quatAngleDeg, isConstraint, dist } from './defs.js';
 
 const NUM_FIELDS = [
   { key: 'mass', label: 'mass', unit: 'kg', tol: 1e-3 },
@@ -9,17 +9,47 @@ const NUM_FIELDS = [
   { key: 'drag', label: 'drag', unit: '', tol: 1e-3 },
 ];
 
+const CONSTRAINT_FIELDS = [
+  { key: 'stiffness', label: 'stiffness', unit: 'N/m', tol: 1e-3 },
+  { key: 'damping', label: 'damping', unit: '', tol: 1e-3 },
+  { key: 'restLength', label: 'rest length', unit: 'm', tol: 1e-4 },
+];
+
 const fmt = (v) => (Math.round(v * 1000) / 1000).toString();
+
+function diffConstraint(a, b, names) {
+  const out = [];
+  const push = (field, text, from, to) => out.push({ id: b.id, name: b.name, field, from, to, text });
+  if (a.a !== b.a || a.b !== b.b) push('ends', `${b.name} now joins ${names(b.a)} and ${names(b.b)}`, [a.a, a.b], [b.a, b.b]);
+  for (const f of CONSTRAINT_FIELDS) {
+    if (a[f.key] === undefined || b[f.key] === undefined) continue;
+    if (Math.abs(a[f.key] - b[f.key]) > f.tol) {
+      push(f.key, `${b.name} ${f.label} ${fmt(a[f.key])} → ${fmt(b[f.key])}${f.unit ? ' ' + f.unit : ''}`, a[f.key], b[f.key]);
+    }
+  }
+  if (a.axis !== b.axis) push('axis', `${b.name} axis ${a.axis.toUpperCase()} → ${b.axis.toUpperCase()}`, a.axis, b.axis);
+  for (const k of ['anchorA', 'anchorB', 'pivotA']) {
+    if (a[k] && b[k] && dist(a[k], b[k]) > 0.002) push(k, `${b.name} attachment point moved ${(dist(a[k], b[k]) * 100).toFixed(1)} cm`, a[k], b[k]);
+  }
+  return out;
+}
 
 export function diffSetups(setupA, setupB) {
   const changes = [];
   const byIdA = new Map(setupA.map((d) => [d.id, d]));
   const byIdB = new Map(setupB.map((d) => [d.id, d]));
 
+  const names = (id) => (byIdB.get(id) || byIdA.get(id))?.name ?? id;
+
   for (const [id, b] of byIdB) {
     const a = byIdA.get(id);
     if (!a) {
       changes.push({ id, name: b.name, field: 'added', text: `${b.name} added` });
+      continue;
+    }
+    if (isConstraint(a) || isConstraint(b)) {
+      if (a.kind !== b.kind) changes.push({ id, name: b.name, field: 'kind', text: `${b.name} changed type` });
+      else changes.push(...diffConstraint(a, b, names));
       continue;
     }
     const moved = Math.hypot(b.position[0] - a.position[0], b.position[1] - a.position[1], b.position[2] - a.position[2]);

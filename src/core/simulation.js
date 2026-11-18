@@ -3,7 +3,8 @@
 // workflow can be driven and tested headlessly.
 import { PhysicsRuntime, FIXED_DT } from './physicsRuntime.js';
 import { RunRecorder } from './recorder.js';
-import { makeDef, cloneDef, cloneSetup, exampleSetup, KINDS } from './defs.js';
+import { makeDef, makeConstraintDef, makeHook, cloneDef, cloneSetup, EXAMPLES, KINDS, CONSTRAINT_KINDS,
+  isConstraint, isObject, toWorld, toLocal, poseOfDef, dist } from './defs.js';
 
 export const MAX_RUN_SECONDS = 12;
 const MAX_STEPS_PER_FRAME = 8;
@@ -43,11 +44,64 @@ export class Simulation extends EventTarget {
     return def.id;
   }
 
+  /**
+   * Connect two objects with a spring or hinge. Rest length / pivot come from
+   * the current layout, so the connection starts relaxed.
+   */
+  connect(kind, a, b, overrides = {}) {
+    if (!CONSTRAINT_KINDS[kind]) throw new Error(`Unknown connection ${kind}`);
+    this.ensureEditable();
+    const A = this.defs.get(a), B = this.defs.get(b);
+    if (!isObject(A) || !isObject(B) || a === b) throw new Error('Pick two different objects');
+    if (A.kind === 'target' || B.kind === 'target') throw new Error('Targets cannot be connected');
+    const opts = { a, b };
+    if (kind === 'spring') {
+      opts.restLength = Math.max(0.05, +dist(A.position, B.position).toFixed(3));
+    } else {
+      // Pivot where the two objects meet: B's centre if B is a small hook, else halfway between them.
+      const small = B.size && Math.max(B.size.x ?? 0, B.size.y ?? 0, B.size.z ?? 0, B.size.radius ?? 0) <= 0.08;
+      const pivot = small ? B.position : A.position.map((v, i) => (v + B.position[i]) / 2);
+      opts.pivotA = toLocal(poseOfDef(A), pivot);
+    }
+    const def = makeConstraintDef(kind, this.newId(kind), { ...opts, ...overrides });
+    this.defs.set(def.id, def);
+    this.structureChanged();
+    return def.id;
+  }
+
+  /** One-click hanging point: a fixed hook above `a` joined by a spring or hinge. */
+  connectToHook(kind, a) {
+    this.ensureEditable();
+    const A = this.defs.get(a);
+    if (!isObject(A) || A.kind === 'target') throw new Error('Pick an object to hang');
+    let hookPos;
+    if (kind === 'hinge' && A.kind !== 'ball') {
+      // Hang from the top end of the object's longest vertical-ish extent.
+      hookPos = toWorld(poseOfDef(A), [0, (A.size.y ?? 0.1) / 2, 0]);
+    } else {
+      hookPos = [A.position[0], A.position[1] + (kind === 'spring' ? 0.35 : 0.3), A.position[2]];
+    }
+    const hookId = this.newId('box');
+    this.defs.set(hookId, makeHook(hookId, hookPos));
+    this.physics.setObject(this.defs.get(hookId));
+    return this.connect(kind, a, hookId);
+  }
+
   remove(id) {
     this.ensureEditable();
-    if (!this.defs.delete(id)) return;
-    this.physics.removeObject(id);
+    const def = this.defs.get(id);
+    if (!def) return;
+    this.defs.delete(id);
+    if (isObject(def)) {
+      this.physics.removeObject(id);
+      // Connections can't exist without both ends.
+      for (const c of [...this.defs.values()]) if (isConstraint(c) && (c.a === id || c.b === id)) this.defs.delete(c.id);
+    }
     this.structureChanged();
+  }
+
+  connectionsOf(id) {
+    return [...this.defs.values()].filter((d) => isConstraint(d) && (d.a === id || d.b === id));
   }
 
   /** Change properties. Shape/kind/static changes rebuild the body. */
@@ -56,14 +110,14 @@ export class Simulation extends EventTarget {
     const def = this.defs.get(id);
     if (!def) return;
     Object.assign(def, cloneDef(patch));
-    this.physics.setObject(def);
+    if (isObject(def)) this.physics.setObject(def); // connections are rebuilt when a run starts
     this.structureChanged();
   }
 
   setPose(id, position, quaternion) {
     if (this.state !== 'edit') return;
     const def = this.defs.get(id);
-    if (!def) return;
+    if (!isObject(def)) return;
     def.position = [...position];
     def.quaternion = [...quaternion];
     this.physics.setPose(id, def.position, def.quaternion);
@@ -88,8 +142,9 @@ export class Simulation extends EventTarget {
     this.stateChanged();
   }
 
-  loadExample() {
-    this.load(exampleSetup());
+  loadExample(name = 'ramp') {
+    this.snapshot = null;
+    this.load((EXAMPLES[name] || EXAMPLES.ramp).build());
   }
 
   ensureEditable() {
@@ -161,6 +216,11 @@ export class Simulation extends EventTarget {
   }
 
   /** Pose to draw an object at right now. */
+  /** Velocity right now (running/review), for live arrows. */
+  liveVelocity(id) {
+    return this.state === 'edit' ? null : this.physics.velocity(id);
+  }
+
   livePose(id) {
     if (this.state === 'edit') {
       const d = this.defs.get(id);

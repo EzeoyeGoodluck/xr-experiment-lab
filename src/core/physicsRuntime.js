@@ -1,9 +1,12 @@
-// Thin wrapper over cannon-es. Works in lab-local coordinates (metres, +Y up),
-// independent of where the lab is placed in the XR world.
+// Thin wrapper over cannon-es. Works in lab-local coordinates (metres, +Y up,
+// bench top at y = 0), independent of where the lab is placed in the XR world.
 import * as CANNON from 'cannon-es';
+import { BENCH, AXES, isConstraint, isObject, toWorld, toLocal, rotateVec, quatConjugate } from './defs.js';
 
 export const FIXED_DT = 1 / 120;
 const ROLLING_SCALE = 0.25; // drag 0..1 → rolling-resistance coefficient 0..0.25
+
+const vec = (a) => new CANNON.Vec3(a[0], a[1], a[2]);
 
 export class PhysicsRuntime {
   constructor() {
@@ -14,18 +17,30 @@ export class PhysicsRuntime {
     this.world.defaultContactMaterial.friction = 0.4;
     this.world.defaultContactMaterial.restitution = 0.3;
 
-    this.floorMaterial = new CANNON.Material({ friction: 0.8, restitution: 0.6 });
-    const floor = new CANNON.Body({ mass: 0, type: CANNON.Body.STATIC, material: this.floorMaterial });
+    // The bench (top at y = 0) and the room floor below it.
+    this.benchMaterial = new CANNON.Material({ friction: 0.8, restitution: 0.6 });
+    const bench = new CANNON.Body({ mass: 0, type: CANNON.Body.STATIC, material: this.benchMaterial });
+    bench.addShape(new CANNON.Box(new CANNON.Vec3(BENCH.width / 2, 0.05, BENCH.depth / 2)));
+    bench.position.set(0, -0.05, BENCH.centerZ);
+    const floor = new CANNON.Body({ mass: 0, type: CANNON.Body.STATIC, material: this.benchMaterial });
     floor.addShape(new CANNON.Plane());
     floor.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+    floor.position.set(0, -BENCH.height, 0);
+    this.world.addBody(bench);
     this.world.addBody(floor);
 
     /** @type {Map<string, CANNON.Body>} */
     this.bodies = new Map();
+    /** @type {Map<string, {kind:string, spring?:CANNON.Spring, constraint?:CANNON.Constraint}>} */
+    this.constraints = new Map();
+    this.world.addEventListener('preStep', () => {
+      for (const c of this.constraints.values()) if (c.spring) c.spring.applyForce();
+    });
   }
 
-  /** Create (or replace) the body for a def. Targets have no body: they are measurement zones. */
+  /** Create (or replace) the body for an object def. Targets have no body: they are measurement zones. */
   setObject(def) {
+    if (!isObject(def)) return;
     this.removeObject(def.id);
     if (def.kind === 'target') return;
 
@@ -57,6 +72,47 @@ export class PhysicsRuntime {
     this.bodies.set(def.id, body);
   }
 
+  /**
+   * Create a spring or hinge. Bodies must already exist and be at their def poses.
+   * Returns false (and creates nothing) if an end is missing, e.g. a target.
+   */
+  setConstraint(def) {
+    this.removeConstraint(def.id);
+    const A = this.bodies.get(def.a);
+    const B = this.bodies.get(def.b);
+    if (!A || !B || A === B) return false;
+    const poseA = this.pose(def.a), poseB = this.pose(def.b);
+
+    if (def.kind === 'spring') {
+      const spring = new CANNON.Spring(A, B, {
+        localAnchorA: vec(def.anchorA), localAnchorB: vec(def.anchorB),
+        restLength: def.restLength, stiffness: def.stiffness, damping: def.damping,
+      });
+      this.constraints.set(def.id, { kind: 'spring', spring });
+    } else if (def.kind === 'hinge') {
+      const pivotWorld = toWorld(poseA, def.pivotA);
+      const axis = AXES[def.axis] || AXES.z;
+      const hinge = new CANNON.HingeConstraint(A, B, {
+        pivotA: vec(def.pivotA),
+        axisA: vec(rotateVec(quatConjugate(poseA.q), axis)),
+        pivotB: vec(toLocal(poseB, pivotWorld)),
+        axisB: vec(rotateVec(quatConjugate(poseB.q), axis)),
+        collideConnected: false,
+        maxForce: 1e6,
+      });
+      this.world.addConstraint(hinge);
+      this.constraints.set(def.id, { kind: 'hinge', constraint: hinge });
+    }
+    return true;
+  }
+
+  removeConstraint(id) {
+    const c = this.constraints.get(id);
+    if (!c) return;
+    if (c.constraint) this.world.removeConstraint(c.constraint);
+    this.constraints.delete(id);
+  }
+
   removeObject(id) {
     const body = this.bodies.get(id);
     if (body) {
@@ -66,12 +122,15 @@ export class PhysicsRuntime {
   }
 
   clear() {
+    for (const id of [...this.constraints.keys()]) this.removeConstraint(id);
     for (const id of [...this.bodies.keys()]) this.removeObject(id);
   }
 
+  /** Objects first, then the connections between them. */
   load(defs) {
     this.clear();
-    for (const def of defs) this.setObject(def);
+    for (const def of defs) if (isObject(def)) this.setObject(def);
+    for (const def of defs) if (isConstraint(def)) this.setConstraint(def);
   }
 
   setPose(id, position, quaternion) {
@@ -126,5 +185,11 @@ export class PhysicsRuntime {
       p: [b.position.x, b.position.y, b.position.z],
       q: [b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w],
     };
+  }
+
+  /** Velocity of a body (m/s), for live arrows. */
+  velocity(id) {
+    const b = this.bodies.get(id);
+    return b ? [b.velocity.x, b.velocity.y, b.velocity.z] : null;
   }
 }

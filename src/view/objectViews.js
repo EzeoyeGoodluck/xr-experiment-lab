@@ -1,5 +1,6 @@
 // Meshes for experiment objects. Built from the same defs as the physics.
 import * as THREE from 'three';
+import { isObject } from '../core/defs.js';
 
 const textureCache = new Map();
 
@@ -97,7 +98,8 @@ export class ObjectViews {
   }
 
   /** Make the meshes match the defs (add, remove, rebuild, re-pose). */
-  reconcile(defs) {
+  reconcile(allDefs) {
+    const defs = allDefs.filter(isObject);
     const ids = new Set(defs.map((d) => d.id));
     for (const [id, mesh] of this.meshes) {
       if (!ids.has(id)) { disposeObject(mesh); this.meshes.delete(id); }

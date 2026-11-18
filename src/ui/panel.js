@@ -1,34 +1,40 @@
 // The HTML control panel (desktop, and phone AR via DOM overlay).
-import { KINDS, quatFromAxisAngle, quatMultiply, rotateVec } from '../core/defs.js';
+import { KINDS, EXAMPLES, CONSTRAINT_KINDS, isConstraint, isObject } from '../core/defs.js';
 import { compareMetrics, gapAt } from '../core/metrics.js';
 import { diffSetups } from '../core/setupDiff.js';
+import { fieldsFor, formatField, applyField, currentSpringLength } from './fields.js';
+import { graphData } from './graphModel.js';
+import { PanelGraph } from '../view/graph.js';
+import { VELOCITY_COLOR, FORCE_COLOR } from '../view/arrows.js';
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmt = (v, unit, digits = 2) => (v === null || v === undefined ? '—' : `${v.toFixed(digits)}${unit ? ' ' + unit : ''}`);
 const fmtDelta = (v, unit) => (v === null ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(2)}${unit ? ' ' + unit : ''}`);
-
-/** Split a rotation into yaw (about Y) and slope (tilt about the object's Z). */
-export function yawAndSlope(q) {
-  const f = rotateVec(q, [1, 0, 0]);
-  const slope = -Math.asin(Math.max(-1, Math.min(1, f[1]))) * 180 / Math.PI;
-  const yaw = Math.atan2(-f[2], f[0]) * 180 / Math.PI;
-  return { yaw, slope };
-}
+const hex = (n) => `#${n.toString(16).padStart(6, '0')}`;
 
 export class Panel {
-  constructor({ root, sim, store, editor, overlay, replay, actions, xrInput }) {
-    Object.assign(this, { root, sim, store, editor, overlay, replay, actions, xrInput });
+  constructor({ root, app }) {
+    this.root = root;
+    this.app = app;
     this.root.innerHTML = this.template();
     this.$ = (sel) => this.root.querySelector(sel);
+    this.graph = new PanelGraph(this.$('#graph'), {
+      onScrub: (t) => { app.replay.playing = false; app.actions.setScrub(t); },
+    });
     this.bind();
     this.refreshAll();
   }
+
+  get sim() { return this.app.sim; }
+  get store() { return this.app.store; }
+  get editor() { return this.app.editor; }
 
   template() {
     return `
       <section>
         <div class="row spread"><h1>XR Experiment Lab</h1><span class="badge" id="state-badge">Editing</span></div>
-        <p class="muted" style="margin:6px 0 0">Build a setup, run it, change something, run again — then compare the two runs in space.</p>
+        <p class="muted" style="margin:6px 0 0">Build a setup, run it, change something, run again, then compare the two runs in space.</p>
+        <p class="notice hidden" id="notice" role="alert"></p>
       </section>
 
       <section class="ar-only">
@@ -46,7 +52,15 @@ export class Panel {
           ${Object.entries(KINDS).map(([k, v]) => `<button type="button" data-add="${k}">+ ${v.label}</button>`).join('')}
         </div>
         <div class="row" style="margin-top:6px">
-          <button type="button" data-act="example">Load ramp example</button>
+          <button type="button" data-connect="spring" title="Then click two objects">⌇ Spring</button>
+          <button type="button" data-connect="hinge" title="Then click two objects">⦿ Hinge</button>
+          <button type="button" data-act="cancel-connect" id="btn-cancel-connect" class="hidden">Cancel</button>
+        </div>
+        <p class="prompt hidden" id="connect-prompt" role="status"></p>
+        <div class="row" style="margin-top:6px">
+          <label class="muted" for="example">Example</label>
+          <select id="example">${Object.entries(EXAMPLES).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>
+          <button type="button" data-act="example">Load</button>
           <button type="button" data-act="clear-scene" class="danger">Clear scene</button>
         </div>
       </section>
@@ -67,7 +81,15 @@ export class Panel {
       <section id="compare"></section>
 
       <section>
-        <div class="row spread"><h2>Runs</h2><small id="run-count"></small></div>
+        <div class="row spread"><h2 style="margin:0" id="graph-title">Graph</h2>
+          <select id="graph-kind" aria-label="Quantity to graph"></select></div>
+        <canvas id="graph" class="graph" aria-label="Graph of the selected quantity over time for Run A, Run B and the live run"></canvas>
+        <div class="row legend-row"><span class="key a">Run A</span><span class="key b">Run B</span><span class="key live">Live run</span>
+          <small>Drag on the graph to scrub.</small></div>
+      </section>
+
+      <section>
+        <div class="row spread"><h2 style="margin:0">Runs</h2><small id="run-count"></small></div>
         <ul class="runs" id="runs"></ul>
       </section>
 
@@ -82,31 +104,52 @@ export class Panel {
         </div>
       </section>
 
+      <section>
+        <details id="diagnostics">
+          <summary><h2 style="display:inline">Diagnostics &amp; study tools</h2></summary>
+          <dl class="diag" id="diag"></dl>
+          <div class="row" style="margin-top:6px">
+            <button type="button" data-act="benchmark">Run physics benchmark</button>
+            <button type="button" data-act="export-perf">Performance log (CSV)</button>
+          </div>
+          <pre class="bench hidden" id="bench"></pre>
+          <h2 style="margin-top:12px">User-study log</h2>
+          <p class="muted" style="margin:0 0 6px">Records actions with timestamps (no personal data). Label is optional, e.g. P01.</p>
+          <div class="row">
+            <input type="text" id="participant" placeholder="Participant label" aria-label="Participant label" style="width:150px">
+            <button type="button" data-act="log-reset">Start new log</button>
+            <button type="button" data-act="export-log">Download log (CSV)</button>
+          </div>
+          <small id="log-count"></small>
+        </details>
+      </section>
+
       <section class="help">
         <h2>Controls</h2>
         <p><b>Mouse:</b> drag to orbit, scroll to zoom, click an object to select it.</p>
-        <p><kbd>W</kbd> move · <kbd>E</kbd> rotate · <kbd>Del</kbd> delete · <kbd>Esc</kbd> deselect</p>
+        <p><kbd>W</kbd> move · <kbd>E</kbd> rotate · <kbd>Del</kbd> delete · <kbd>Esc</kbd> deselect / cancel</p>
         <p><kbd>Space</kbd> run / stop · <kbd>R</kbd> back to setup · <kbd>P</kbd> play replay · <kbd>←</kbd><kbd>→</kbd> scrub</p>
-        <p><b>VR:</b> trigger grabs, grip runs / stops / resets, thumbstick scrubs, A/X plays.</p>
+        <p><b>VR:</b> point and pull the trigger to use the floating panel, select or grab objects. Grip runs / stops / resets, thumbstick scrubs, A/X plays, B/Y hides the panel.</p>
+        <p><b>No headset?</b> Add <code>?emulate=quest3</code> to the address to try VR with an emulated Quest 3.</p>
       </section>`;
   }
 
   bind() {
+    const a = this.app;
     this.root.addEventListener('click', (e) => {
       const btn = e.target.closest('button');
       if (!btn) return;
-      if (btn.dataset.add) {
-        const id = this.sim.add(btn.dataset.add, this.spawnOverrides(btn.dataset.add));
-        this.editor.select(id);
-        return;
-      }
+      if (btn.dataset.add) { a.actions.spawn(btn.dataset.add); return; }
+      if (btn.dataset.connect) { this.editor.beginConnect(btn.dataset.connect); return; }
+      if (btn.dataset.choice) { this.onField(btn.dataset.field, btn.dataset.choice); this.renderInspector(true); return; }
       this.onAction(btn.dataset.act, btn);
     });
 
     this.root.addEventListener('input', (e) => {
       const t = e.target;
-      if (t.dataset.prop) this.onPropInput(t);
-      if (t.id === 'scrub') { this.replay.playing = false; this.actions.setScrub(parseFloat(t.value)); }
+      if (t.dataset.field) this.onField(t.dataset.field, t.type === 'checkbox' ? t.checked : parseFloat(t.value), t);
+      if (t.dataset.name) this.sim.update(this.editor.selectedId, { name: t.value });
+      if (t.id === 'scrub') { a.replay.playing = false; a.actions.setScrub(parseFloat(t.value)); }
       if (t.id === 'notes') this.store.setNotes(this.store.slots.B, t.value);
     });
 
@@ -115,8 +158,10 @@ export class Panel {
       if (t.name === 'slotA') this.store.setSlot('A', t.value);
       if (t.name === 'slotB') this.store.setSlot('B', t.value);
       if (t.dataset.rename) this.store.rename(t.dataset.rename, t.value.trim() || 'Untitled run');
-      if (t.dataset.opt) this.overlay.setOptions({ [t.dataset.opt]: t.checked });
-      if (t.id === 'speed') this.replay.speed = parseFloat(t.value);
+      if (t.dataset.opt) a.actions.setOverlayOption(t.dataset.opt, t.checked);
+      if (t.id === 'speed') a.replay.speed = parseFloat(t.value);
+      if (t.id === 'graph-kind') a.actions.setGraphKind(t.value);
+      if (t.dataset.name) this.renderRuns();
       if (t.id === 'import-file' && t.files[0]) this.importFile(t.files[0]);
     });
 
@@ -124,31 +169,42 @@ export class Panel {
     this.root.closest('#ui-root')?.addEventListener('beforexrselect', (e) => e.preventDefault());
   }
 
-  spawnOverrides(kind) {
-    // Drop new objects near the middle of the lab, slightly staggered.
-    const n = this.sim.defs.size;
-    const x = -0.2 + (n % 4) * 0.15;
-    if (kind === 'ball') return { position: [x, 0.6, -1.2] };
-    if (kind === 'box') return { position: [x, 0.3, -1.0] };
-    if (kind === 'target') return { position: [0.6 + (n % 3) * 0.1, 0.002, -1.2] };
-    return {};
+  onField(key, value, input) {
+    const id = this.editor.selectedId;
+    const def = this.sim.defs.get(id);
+    if (!def) return;
+    const field = fieldsFor(def).find((f) => f.key === key);
+    const out = input?.closest('.slider')?.querySelector('output');
+    if (out && field) out.textContent = formatField(field, value);
+    const structural = applyField(this.sim, id, key, value);
+    this.app.log('edit', { id, field: key, value });
+    if (structural) this.renderInspector(true);
   }
 
   onAction(act, btn) {
-    const { sim, store } = this;
+    const { sim, store, app } = this;
     switch (act) {
-      case 'example': sim.loadExample(); this.editor.select('ramp-1'); break;
-      case 'clear-scene': sim.load([]); break;
-      case 'run': this.actions.run(); break;
+      case 'example': app.actions.loadExample(this.$('#example').value); break;
+      case 'clear-scene': app.actions.clearScene(); break;
+      case 'run': app.actions.run(); break;
       case 'stop': sim.stop(); break;
       case 'reset': sim.reset(); break;
-      case 'delete': if (this.editor.selectedId) sim.remove(this.editor.selectedId); break;
+      case 'cancel-connect': this.editor.cancelConnect(); break;
+      case 'delete': app.actions.deleteSelected(); break;
+      case 'hook-spring': this.editor.connectSelectedToHook('spring'); break;
+      case 'hook-hinge': this.editor.connectSelectedToHook('hinge'); break;
+      case 'rest-now': {
+        const def = sim.defs.get(this.editor.selectedId);
+        const len = currentSpringLength(sim, def);
+        if (len) { sim.update(def.id, { restLength: +len.toFixed(3) }); this.renderInspector(true); }
+        break;
+      }
       case 'mode-translate': this.editor.setMode('translate'); break;
       case 'mode-rotate': this.editor.setMode('rotate'); break;
-      case 'play': this.actions.togglePlay(); break;
+      case 'play': app.actions.togglePlay(); break;
       case 'open': {
         const run = store.get(btn.dataset.id);
-        if (run) { sim.load(run.setup); sim.snapshot = null; this.actions.toast(`Opened the setup from ${run.name}`); }
+        if (run) { sim.load(run.setup); sim.snapshot = null; app.actions.toast(`Opened the setup from ${run.name}`); app.log('open-setup', { id: run.id }); }
         break;
       }
       case 'del-run': store.remove(btn.dataset.id); break;
@@ -160,52 +216,14 @@ export class Panel {
         if (btn.dataset.confirm) { store.clear(); delete btn.dataset.confirm; btn.textContent = 'Clear runs'; }
         else { btn.dataset.confirm = '1'; btn.textContent = 'Click again to clear'; setTimeout(() => { delete btn.dataset.confirm; btn.textContent = 'Clear runs'; }, 3000); }
         break;
-      case 'ar-place': this.xrInput?.startPlacing(); this.actions.toast('Tap a surface to place the lab'); break;
-      case 'ar-scale': this.xrInput?.setArScale(parseFloat(btn.dataset.scale)); break;
+      case 'ar-place': app.xrInput.startPlacing(); app.actions.toast('Tap a surface to place the lab'); break;
+      case 'ar-scale': app.xrInput.setArScale(parseFloat(btn.dataset.scale)); break;
+      case 'benchmark': this.runBenchmark(); break;
+      case 'export-perf': this.download(`performance-${stamp()}.csv`, app.perf.csv(), 'text/csv'); break;
+      case 'log-reset': app.interactionLog.reset(this.$('#participant').value.trim()); this.updateDiagnostics(); app.actions.toast('New study log started'); break;
+      case 'export-log': this.download(`interaction-log-${app.interactionLog.label || 'session'}-${stamp()}.csv`, app.interactionLog.csv(), 'text/csv'); break;
       default: break;
     }
-  }
-
-  onPropInput(t) {
-    const id = this.editor.selectedId;
-    const def = this.sim.defs.get(id);
-    if (!def) return;
-    const prop = t.dataset.prop;
-    const value = t.type === 'checkbox' ? t.checked : t.type === 'text' ? t.value : parseFloat(t.value);
-    const out = t.closest('.slider')?.querySelector('output');
-    if (out) out.textContent = t.dataset.unit === '°' ? `${value.toFixed(0)}°` : value.toFixed(2);
-
-    if (prop === 'slope') {
-      const { yaw } = yawAndSlope(def.quaternion);
-      const q = quatMultiply(quatFromAxisAngle([0, 1, 0], yaw), quatFromAxisAngle([0, 0, 1], -value));
-      const position = [...def.position];
-      if (def.kind === 'ramp' && this.restsOnFloor(def)) {
-        position[1] = (def.size.x / 2) * Math.sin(Math.abs(value) * Math.PI / 180) + (def.size.y / 2) * Math.cos(value * Math.PI / 180);
-      }
-      this.sim.ensureEditable();
-      this.sim.setPose(id, position, q);
-      this.editor.refresh();
-      return;
-    }
-    if (prop.startsWith('size.')) {
-      const k = prop.slice(5);
-      this.sim.update(id, { size: { ...def.size, [k]: value } });
-      return;
-    }
-    if (prop === 'isStatic') {
-      this.sim.update(id, { isStatic: value, mass: value ? 0 : (def.mass > 0 ? def.mass : 1) });
-      this.renderInspector(true);
-      return;
-    }
-    this.sim.update(id, { [prop]: value });
-    if (prop === 'name') this.renderRuns();
-  }
-
-  restsOnFloor(def) {
-    const { slope } = yawAndSlope(def.quaternion);
-    const r = slope * Math.PI / 180;
-    const bottom = def.position[1] - ((def.size.x / 2) * Math.sin(Math.abs(r)) + (def.size.y / 2) * Math.cos(r));
-    return Math.abs(bottom) < 0.02;
   }
 
   // ---------- rendering ----------
@@ -215,6 +233,13 @@ export class Panel {
     this.refreshState();
     this.renderRuns();
     this.renderCompare();
+    this.renderConnect();
+  }
+
+  notice(text) {
+    const el = this.$('#notice');
+    el.textContent = text || '';
+    el.classList.toggle('hidden', !text);
   }
 
   refreshState() {
@@ -227,9 +252,9 @@ export class Panel {
     this.$('#btn-reset').disabled = s === 'edit';
     const last = this.sim.lastRun;
     this.$('#status').textContent =
-      s === 'edit' ? (this.sim.defs.size ? 'Edit the setup, then press Run. Every run is recorded.' : 'Add objects or load the ramp example.')
+      s === 'edit' ? (this.sim.defs.size ? 'Edit the setup, then press Run. Every run is recorded.' : 'Add objects or load an example.')
       : s === 'running' ? 'Recording this run…'
-      : `${last?.name ?? 'Run'} saved (${last?.endReason ?? 'stopped'}). It is now Run B below. Go back to the setup, change something and run again.`;
+      : `${last?.name ?? 'Run'} saved (${last?.endReason ?? 'stopped'}). It is now Run B. Go back to the setup, change something and run again.`;
     this.updateClock();
     this.renderInspector();
   }
@@ -239,63 +264,79 @@ export class Panel {
     this.$('#clock').textContent = `${t.toFixed(2)} s`;
   }
 
+  renderConnect(message = null) {
+    const prompt = this.$('#connect-prompt');
+    const text = message || this.editor.connectPrompt();
+    prompt.textContent = text;
+    prompt.classList.toggle('hidden', !text);
+    this.$('#btn-cancel-connect').classList.toggle('hidden', !this.editor.connecting);
+    for (const b of this.root.querySelectorAll('[data-connect]')) b.classList.toggle('active', this.editor.connecting?.kind === b.dataset.connect);
+  }
+
   renderInspector(force = false) {
     const el = this.$('#inspector');
     // Don't rebuild the inspector under the user's pointer mid-drag.
     if (!force && el.contains(document.activeElement) && document.activeElement !== el) return;
     const def = this.sim.defs.get(this.editor.selectedId);
     if (!def) {
-      el.innerHTML = `<h2>Inspector</h2><p class="muted" style="margin:0">Click an object to edit it.</p>`;
+      el.innerHTML = `<h2>Inspector</h2><p class="muted" style="margin:0">Click an object, spring or hinge to edit it.</p>`;
       return;
     }
     const locked = this.sim.state !== 'edit';
-    const slider = (prop, label, min, max, step, value, unit = '') => `
-      <div class="slider">
-        <label for="p-${prop}">${label}</label>
-        <input id="p-${prop}" type="range" min="${min}" max="${max}" step="${step}" value="${value}" data-prop="${prop}" data-unit="${unit}">
-        <output>${unit === '°' ? `${value.toFixed(0)}°` : value.toFixed(2)}</output>
-      </div>`;
-    const parts = [];
-    if (def.kind !== 'target') {
-      parts.push(`<label class="check"><input type="checkbox" data-prop="isStatic" ${def.isStatic ? 'checked' : ''}> Fixed in place (does not move)</label>`);
-      if (!def.isStatic) parts.push(slider('mass', 'Mass (kg)', 0.05, 5, 0.05, def.mass));
-      parts.push(slider('friction', 'Friction', 0, 1, 0.01, def.friction));
-      parts.push(slider('restitution', 'Bounciness', 0, 1, 0.01, def.restitution));
-      if (def.kind === 'ball') parts.push(slider('drag', 'Rolling drag', 0, 1, 0.01, def.drag));
+    const kindLabel = (KINDS[def.kind] || CONSTRAINT_KINDS[def.kind]).label;
+    const controls = fieldsFor(def).map((f) => {
+      if (f.type === 'slider') return `
+        <div class="slider">
+          <label for="f-${f.key}">${f.label}</label>
+          <input id="f-${f.key}" type="range" min="${f.min}" max="${f.max}" step="${f.step}" value="${f.value}" data-field="${f.key}">
+          <output>${formatField(f)}</output>
+        </div>`;
+      if (f.type === 'toggle') return `<label class="check"><input type="checkbox" data-field="${f.key}" ${f.value ? 'checked' : ''}> ${f.label} (does not move)</label>`;
+      if (f.type === 'choice') return `<div class="row" style="margin:6px 0"><span class="muted" style="width:92px">${f.label}</span>
+        ${f.options.map((o) => `<button type="button" class="small ${f.value === o ? 'active' : ''}" data-field="${f.key}" data-choice="${o}">${o.toUpperCase()}</button>`).join('')}</div>`;
+      return '';
+    }).join('');
+    const extra = [];
+    if (isObject(def) && def.kind !== 'target') {
+      const n = this.sim.connectionsOf(def.id).length;
+      extra.push(`<div class="row" style="margin-top:6px">
+        <button type="button" class="small" data-act="hook-spring" title="Add a fixed hook above and a spring to it">Hang on spring</button>
+        <button type="button" class="small" data-act="hook-hinge" title="Add a fixed hook and a hinge (pendulum)">Hang on hinge</button>
+        ${n ? `<small>${n} connection${n > 1 ? 's' : ''}</small>` : ''}</div>`);
     }
-    if (def.kind === 'ball' || def.kind === 'target') {
-      parts.push(slider('size.radius', 'Radius (m)', def.kind === 'ball' ? 0.02 : 0.05, def.kind === 'ball' ? 0.3 : 0.6, 0.005, def.size.radius));
-    } else {
-      parts.push(slider('size.x', 'Length (m)', 0.04, 2.5, 0.01, def.size.x));
-      parts.push(slider('size.y', 'Thickness (m)', 0.02, 1, 0.01, def.size.y));
-      parts.push(slider('size.z', 'Width (m)', 0.04, 1.5, 0.01, def.size.z));
-      parts.push(slider('slope', 'Slope', -60, 60, 0.5, yawAndSlope(def.quaternion).slope, '°'));
+    if (def.kind === 'spring') {
+      const len = currentSpringLength(this.sim, def);
+      extra.push(`<div class="row" style="margin-top:6px"><button type="button" class="small" data-act="rest-now">Set rest length to current (${len?.toFixed(2)} m)</button></div>`);
     }
+    const ends = isConstraint(def) ? `<p class="muted" style="margin:2px 0 6px">${esc(this.sim.defs.get(def.a)?.name ?? def.a)} ↔ ${esc(this.sim.defs.get(def.b)?.name ?? def.b)}</p>` : '';
     el.innerHTML = `
       <div class="row spread">
         <h2 style="margin:0">Inspector</h2>
         <div class="row">
+          ${isObject(def) ? `
           <button type="button" class="small ${this.editor.mode === 'translate' ? 'active' : ''}" data-act="mode-translate" title="Move (W)">Move</button>
-          <button type="button" class="small ${this.editor.mode === 'rotate' ? 'active' : ''}" data-act="mode-rotate" title="Rotate (E)">Rotate</button>
+          <button type="button" class="small ${this.editor.mode === 'rotate' ? 'active' : ''}" data-act="mode-rotate" title="Rotate (E)">Rotate</button>` : ''}
           <button type="button" class="small danger" data-act="delete" title="Delete (Del)">Delete</button>
         </div>
       </div>
       <div class="row" style="margin:8px 0 4px">
-        <input type="text" data-prop="name" value="${esc(def.name)}" aria-label="Object name" style="flex:1">
-        <small>${KINDS[def.kind].label}</small>
+        <input type="text" data-name="1" value="${esc(def.name)}" aria-label="Name" style="flex:1">
+        <small>${kindLabel}</small>
       </div>
+      ${ends}
       ${locked ? '<p class="muted" style="margin:4px 0">Changing a value returns to the setup first.</p>' : ''}
-      ${parts.join('')}`;
+      ${controls}
+      ${extra.join('')}`;
   }
 
-  /** Update just the current object's slider for slope after gizmo rotation. */
+  /** Keep the slope slider in step with gizmo rotation. */
   syncSlope() {
     const def = this.sim.defs.get(this.editor.selectedId);
-    const input = this.root.querySelector('[data-prop="slope"]');
+    const input = this.root.querySelector('[data-field="slope"]');
     if (!def || !input || document.activeElement === input) return;
-    const s = yawAndSlope(def.quaternion).slope;
-    input.value = s;
-    input.closest('.slider').querySelector('output').textContent = `${s.toFixed(0)}°`;
+    const f = fieldsFor(def).find((x) => x.key === 'slope');
+    input.value = f.value;
+    input.closest('.slider').querySelector('output').textContent = formatField(f);
   }
 
   renderRuns() {
@@ -327,14 +368,16 @@ export class Panel {
     const { A, B } = this.store.slotRuns();
     if (!A && !B) {
       el.innerHTML = `<h2>Compare</h2><p class="muted" style="margin:0">Record two runs to compare them. The newest run becomes B and the one before it A.</p>`;
+      this.drawGraph();
       return;
     }
     const primary = (B || A).metrics.primaryId;
     const rows = compareMetrics(A?.metrics, B?.metrics, primary);
     const primaryName = (B || A).setup.find((d) => d.id === primary)?.name ?? 'object';
     const changes = A && B ? diffSetups(A.setup, B.setup) : [];
-    const o = this.overlay.options;
-    const dur = this.overlay.duration();
+    const o = this.app.overlay.options;
+    const dur = this.app.overlay.duration();
+    const opt = (k, label, extra = '') => `<label class="check"><input type="checkbox" data-opt="${k}" ${o[k] ? 'checked' : ''}> ${label}${extra}</label>`;
     el.innerHTML = `
       <div class="row spread"><h2 style="margin:0">Compare</h2><button type="button" class="small" data-act="swap" title="Swap A and B">⇄ Swap</button></div>
       <div class="legend" style="margin-top:8px">
@@ -342,19 +385,18 @@ export class Panel {
         <div class="b" title="${esc(B?.name ?? '')}">B · ${esc(B?.name ?? '—')}</div>
       </div>
       <div class="row">
-        <label class="check"><input type="checkbox" data-opt="paths" ${o.paths ? 'checked' : ''}> Paths</label>
-        <label class="check"><input type="checkbox" data-opt="ghosts" ${o.ghosts ? 'checked' : ''}> Ghosts</label>
-        <label class="check"><input type="checkbox" data-opt="setups" ${o.setups ? 'checked' : ''}> Setups</label>
+        ${opt('paths', 'Paths')}${opt('ghosts', 'Ghosts')}${opt('setups', 'Setups')}${opt('impacts', 'Hits')}
+        ${opt('arrows', 'Arrows', ` <span class="swatch" style="background:${hex(VELOCITY_COLOR)}" title="velocity"></span><span class="swatch" style="background:${hex(FORCE_COLOR)}" title="contact force"></span>`)}
       </div>
       <div class="scrub">
         <button type="button" class="small" data-act="play" id="btn-play" aria-label="Play replay">▶</button>
-        <input type="range" id="scrub" min="0" max="${dur}" step="${1 / 120}" value="${this.replay.time}" aria-label="Replay time">
+        <input type="range" id="scrub" min="0" max="${dur}" step="${1 / 120}" value="${this.app.replay.time}" aria-label="Replay time">
         <output id="scrub-out"></output>
       </div>
       <div class="row spread">
         <span class="gap" id="gap"></span>
         <label class="muted" style="font-size:13px">Speed <select id="speed">
-          ${[0.1, 0.25, 0.5, 1, 2].map((s) => `<option value="${s}" ${this.replay.speed === s ? 'selected' : ''}>${s}×</option>`).join('')}
+          ${[0.1, 0.25, 0.5, 1, 2].map((s) => `<option value="${s}" ${this.app.replay.speed === s ? 'selected' : ''}>${s}×</option>`).join('')}
         </select></label>
       </div>
       <table class="metrics">
@@ -375,17 +417,65 @@ export class Panel {
   }
 
   updateScrub() {
+    this.drawGraph();
     const scrub = this.$('#scrub');
     if (!scrub) return;
-    const dur = this.overlay.duration();
-    if (document.activeElement !== scrub) scrub.value = this.replay.time;
-    this.$('#scrub-out').textContent = `${this.replay.time.toFixed(2)} / ${dur.toFixed(2)} s`;
-    this.$('#btn-play').textContent = this.replay.playing ? '❚❚' : '▶';
-    this.$('#btn-play').setAttribute('aria-label', this.replay.playing ? 'Pause replay' : 'Play replay');
+    const dur = this.app.overlay.duration();
+    if (document.activeElement !== scrub) scrub.value = this.app.replay.time;
+    this.$('#scrub-out').textContent = `${this.app.replay.time.toFixed(2)} / ${dur.toFixed(2)} s`;
+    const play = this.$('#btn-play');
+    play.textContent = this.app.replay.playing ? '❚❚' : '▶';
+    play.setAttribute('aria-label', this.app.replay.playing ? 'Pause replay' : 'Play replay');
     const { A, B } = this.store.slotRuns();
     const id = (B || A)?.metrics.primaryId;
-    const gap = A && B ? gapAt(A, B, id, this.replay.time) : null;
+    const gap = A && B ? gapAt(A, B, id, this.app.replay.time) : null;
     this.$('#gap').textContent = gap === null ? '' : `Gap between A and B at this moment: ${(gap * 100).toFixed(1)} cm`;
+  }
+
+  drawGraph() {
+    const data = graphData(this.app);
+    this.$('#graph-title').textContent = data.kind ? `Graph · ${data.subjectName}` : 'Graph';
+    const sel = this.$('#graph-kind');
+    const key = data.kinds.join(',');
+    if (sel.dataset.kinds !== key) {
+      sel.innerHTML = data.kinds.map((k) => `<option value="${k}">${esc(graphLabel(k))}</option>`).join('');
+      sel.dataset.kinds = key;
+    }
+    if (data.kind && sel.value !== data.kind) sel.value = data.kind;
+    sel.disabled = data.kinds.length < 2;
+    this.graph.draw({ ...data, unit: data.unit });
+  }
+
+  updateDiagnostics() {
+    const d = this.$('#diagnostics');
+    if (!d.open) return;
+    const s = this.app.perf.stats();
+    const st = this.app.status;
+    const xr = this.app.stage.xr.support;
+    const rows = [
+      ['Mode', this.app.stage.mode],
+      ['Frame rate', s ? `${s.fps.toFixed(0)} fps (budget ${s.budgetMs.toFixed(1)} ms)` : '—'],
+      ['Frame time', s ? `avg ${s.frameAvgMs.toFixed(1)} · p95 ${s.frameP95Ms.toFixed(1)} · max ${s.frameMaxMs.toFixed(0)} ms` : '—'],
+      ['Over budget', s ? `${s.overBudgetPct.toFixed(1)} % of frames` : '—'],
+      ['Physics / render', s ? `${s.physicsAvgMs.toFixed(2)} / ${s.renderAvgMs.toFixed(2)} ms per frame` : '—'],
+      ['Recording', `${(this.app.recordingBytes() / 1024).toFixed(0)} KB in ${this.store.runs.length} runs`],
+      ['WebXR', `${xr.api ? 'available' : 'not available'}${xr.secure ? '' : ' (page not secure)'} · VR ${xr.vr ? 'yes' : 'no'} · AR ${xr.ar ? 'yes' : 'no'}${this.app.emulated ? ' · emulated Quest 3' : ''}`],
+      ['Session', st.trackingLost ? 'tracking lost (paused)' : st.hidden ? 'hidden (paused)' : this.app.stage.xr.session ? `running${this.app.stage.xr.floorFallback ? ', floor height assumed' : ''}` : '—'],
+      ['Storage', this.store.storage ? 'saving runs in this browser' : 'not available: export to keep runs'],
+    ];
+    this.$('#diag').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('');
+    this.$('#log-count').textContent = `${this.app.interactionLog.events.length} events logged${this.app.interactionLog.label ? ` for ${this.app.interactionLog.label}` : ''}`;
+  }
+
+  runBenchmark() {
+    const out = this.$('#bench');
+    out.classList.remove('hidden');
+    out.textContent = 'Running…';
+    setTimeout(() => {
+      const res = this.app.actions.benchmark();
+      out.textContent = ['example     ms/step  × real time', ...res.map((r) =>
+        `${r.example.padEnd(11)} ${r.msPerStep.toFixed(3).padStart(7)}  ${r.realtimeFactor.toFixed(0).padStart(6)}×`)].join('\n');
+    }, 30);
   }
 
   // ---------- data ----------
@@ -418,12 +508,16 @@ export class Panel {
   async importFile(file) {
     try {
       this.store.loadJSON(JSON.parse(await file.text()), { replace: false });
-      this.actions.toast(`Imported runs from ${file.name}`);
+      this.app.actions.toast(`Imported runs from ${file.name}`);
     } catch (err) {
-      this.actions.toast(`Could not import: ${err.message}`);
+      this.app.actions.toast(`Could not import: ${err.message}`);
     }
     this.$('#import-file').value = '';
   }
+}
+
+function graphLabel(k) {
+  return { speed: 'Speed', height: 'Height', distance: 'Distance to target', stretch: 'Spring stretch', force: 'Spring force', angle: 'Hinge angle' }[k] || k;
 }
 
 function stamp() {
